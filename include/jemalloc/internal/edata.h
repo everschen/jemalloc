@@ -13,17 +13,26 @@
 #include "jemalloc/internal/sz.h"
 #include "jemalloc/internal/typed_list.h"
 
+/*
+ * sizeof(edata_t) is 128 bytes on 64-bit architectures.  Ensure the alignment
+ * to free up the low bits in the rtree leaf.
+ */
+#define EDATA_ALIGNMENT 128
+
 enum extent_state_e {
 	extent_state_active   = 0,
 	extent_state_dirty    = 1,
 	extent_state_muzzy    = 2,
-	extent_state_retained = 3
+	extent_state_retained = 3,
+	extent_state_transition = 4, /* States below are intermediate. */
+	extent_state_merging = 5,
+	extent_state_max = 5 /* Sanity checking only. */
 };
 typedef enum extent_state_e extent_state_t;
 
 enum extent_head_state_e {
 	EXTENT_NOT_HEAD,
-	EXTENT_IS_HEAD   /* Only relevant for Windows && opt.retain. */
+	EXTENT_IS_HEAD   /* See comments in ehooks_default_merge_impl(). */
 };
 typedef enum extent_head_state_e extent_head_state_t;
 
@@ -88,7 +97,7 @@ struct edata_s {
 	 * f: nfree
 	 * s: bin_shard
 	 *
-	 * 00000000 ... 000000ss ssssffff ffffffii iiiiiitt zpcbaaaa aaaaaaaa
+	 * 00000000 ... 00000sss sssfffff fffffiii iiiiittt zpcbaaaa aaaaaaaa
 	 *
 	 * arena_ind: Arena from which this extent came, or all 1 bits if
 	 *            unassociated.
@@ -143,7 +152,7 @@ struct edata_s {
 #define EDATA_BITS_ZEROED_SHIFT  (EDATA_BITS_PAI_WIDTH + EDATA_BITS_PAI_SHIFT)
 #define EDATA_BITS_ZEROED_MASK  MASK(EDATA_BITS_ZEROED_WIDTH, EDATA_BITS_ZEROED_SHIFT)
 
-#define EDATA_BITS_STATE_WIDTH  2
+#define EDATA_BITS_STATE_WIDTH  3
 #define EDATA_BITS_STATE_SHIFT  (EDATA_BITS_ZEROED_WIDTH + EDATA_BITS_ZEROED_SHIFT)
 #define EDATA_BITS_STATE_MASK  MASK(EDATA_BITS_STATE_WIDTH, EDATA_BITS_STATE_SHIFT)
 
@@ -542,6 +551,11 @@ static inline void
 edata_is_head_set(edata_t *edata, bool is_head) {
 	edata->e_bits = (edata->e_bits & ~EDATA_BITS_IS_HEAD_MASK) |
 	    ((uint64_t)is_head << EDATA_BITS_IS_HEAD_SHIFT);
+}
+
+static inline bool
+edata_state_in_transition(extent_state_t state) {
+	return state >= extent_state_transition;
 }
 
 /*

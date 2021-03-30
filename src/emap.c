@@ -3,15 +3,6 @@
 
 #include "jemalloc/internal/emap.h"
 
-/*
- * Note: Ends without at semicolon, so that
- *     EMAP_DECLARE_RTREE_CTX;
- * in uses will avoid empty-statement warnings.
- */
-#define EMAP_DECLARE_RTREE_CTX						\
-    rtree_ctx_t rtree_ctx_fallback;					\
-    rtree_ctx_t *rtree_ctx = tsdn_rtree_ctx(tsdn, &rtree_ctx_fallback)
-
 enum emap_lock_result_e {
 	emap_lock_result_success,
 	emap_lock_result_failure,
@@ -21,96 +12,108 @@ typedef enum emap_lock_result_e emap_lock_result_t;
 
 bool
 emap_init(emap_t *emap, base_t *base, bool zeroed) {
-	bool err;
-	err = rtree_new(&emap->rtree, base, zeroed);
-	if (err) {
-		return true;
-	}
-	err = mutex_pool_init(&emap->mtx_pool, "emap_mutex_pool",
-	    WITNESS_RANK_EMAP);
-	if (err) {
-		return true;
-	}
-	return false;
+	return rtree_new(&emap->rtree, base, zeroed);
 }
 
 void
-emap_lock_edata(tsdn_t *tsdn, emap_t *emap, edata_t *edata) {
-	assert(edata != NULL);
-	mutex_pool_lock(tsdn, &emap->mtx_pool, (uintptr_t)edata);
-}
+emap_update_edata_state(tsdn_t *tsdn, emap_t *emap, edata_t *edata,
+    extent_state_t state) {
+	witness_assert_positive_depth_to_rank(tsdn_witness_tsdp_get(tsdn),
+	    WITNESS_RANK_CORE);
 
-void
-emap_unlock_edata(tsdn_t *tsdn, emap_t *emap, edata_t *edata) {
-	assert(edata != NULL);
-	mutex_pool_unlock(tsdn, &emap->mtx_pool, (uintptr_t)edata);
-}
+	edata_state_set(edata, state);
 
-void
-emap_lock_edata2(tsdn_t *tsdn, emap_t *emap, edata_t *edata1,
-    edata_t *edata2) {
-	assert(edata1 != NULL && edata2 != NULL);
-	mutex_pool_lock2(tsdn, &emap->mtx_pool, (uintptr_t)edata1,
-	    (uintptr_t)edata2);
-}
-
-void
-emap_unlock_edata2(tsdn_t *tsdn, emap_t *emap, edata_t *edata1,
-    edata_t *edata2) {
-	assert(edata1 != NULL && edata2 != NULL);
-	mutex_pool_unlock2(tsdn, &emap->mtx_pool, (uintptr_t)edata1,
-	    (uintptr_t)edata2);
-}
-
-static inline emap_lock_result_t
-emap_try_lock_rtree_leaf_elm(tsdn_t *tsdn, emap_t *emap, rtree_leaf_elm_t *elm,
-    edata_t **result, bool inactive_only) {
-	edata_t *edata1 = rtree_leaf_elm_read(tsdn, &emap->rtree, elm,
-	    /* dependent */ true).edata;
-
-	/* Slab implies active extents and should be skipped. */
-	if (edata1 == NULL || (inactive_only && rtree_leaf_elm_read(tsdn,
-	    &emap->rtree, elm, /* dependent */ true).metadata.slab)) {
-		return emap_lock_result_no_extent;
-	}
-
-	/*
-	 * It's possible that the extent changed out from under us, and with it
-	 * the leaf->edata mapping.  We have to recheck while holding the lock.
-	 */
-	emap_lock_edata(tsdn, emap, edata1);
-	edata_t *edata2 = rtree_leaf_elm_read(tsdn, &emap->rtree, elm,
-	    /* dependent */ true).edata;
-
-	if (edata1 == edata2) {
-		*result = edata1;
-		return emap_lock_result_success;
-	} else {
-		emap_unlock_edata(tsdn, emap, edata1);
-		return emap_lock_result_failure;
-	}
-}
-
-/*
- * Returns a pool-locked edata_t * if there's one associated with the given
- * address, and NULL otherwise.
- */
-edata_t *
-emap_lock_edata_from_addr(tsdn_t *tsdn, emap_t *emap, void *addr,
-    bool inactive_only) {
 	EMAP_DECLARE_RTREE_CTX;
-	edata_t *ret = NULL;
+	rtree_leaf_elm_t *elm1 = rtree_leaf_elm_lookup(tsdn, &emap->rtree,
+	    rtree_ctx, (uintptr_t)edata_base_get(edata), /* dependent */ true,
+	    /* init_missing */ false);
+	assert(elm1 != NULL);
+	rtree_leaf_elm_t *elm2 = edata_size_get(edata) == PAGE ? NULL :
+	    rtree_leaf_elm_lookup(tsdn, &emap->rtree, rtree_ctx,
+	    (uintptr_t)edata_last_get(edata), /* dependent */ true,
+	    /* init_missing */ false);
+
+	rtree_leaf_elm_state_update(tsdn, &emap->rtree, elm1, elm2, state);
+
+	emap_assert_mapped(tsdn, emap, edata);
+}
+
+static inline edata_t *
+emap_try_acquire_edata_neighbor_impl(tsdn_t *tsdn, emap_t *emap, edata_t *edata,
+    extent_pai_t pai, extent_state_t expected_state, bool forward,
+    bool expanding) {
+	witness_assert_positive_depth_to_rank(tsdn_witness_tsdp_get(tsdn),
+	    WITNESS_RANK_CORE);
+	assert(!expanding || forward);
+	assert(!edata_state_in_transition(expected_state));
+	assert(expected_state == extent_state_dirty ||
+	       expected_state == extent_state_muzzy ||
+	       expected_state == extent_state_retained);
+
+	void *neighbor_addr = forward ? edata_past_get(edata) :
+	    edata_before_get(edata);
+	/*
+	 * This is subtle; the rtree code asserts that its input pointer is
+	 * non-NULL, and this is a useful thing to check.  But it's possible
+	 * that edata corresponds to an address of (void *)PAGE (in practice,
+	 * this has only been observed on FreeBSD when address-space
+	 * randomization is on, but it could in principle happen anywhere).  In
+	 * this case, edata_before_get(edata) is NULL, triggering the assert.
+	 */
+	if (neighbor_addr == NULL) {
+		return NULL;
+	}
+
+	EMAP_DECLARE_RTREE_CTX;
 	rtree_leaf_elm_t *elm = rtree_leaf_elm_lookup(tsdn, &emap->rtree,
-	    rtree_ctx, (uintptr_t)addr, false, false);
+	    rtree_ctx, (uintptr_t)neighbor_addr, /* dependent*/ false,
+	    /* init_missing */ false);
 	if (elm == NULL) {
 		return NULL;
 	}
-	emap_lock_result_t lock_result;
-	do {
-		lock_result = emap_try_lock_rtree_leaf_elm(tsdn, emap, elm,
-		    &ret, inactive_only);
-	} while (lock_result == emap_lock_result_failure);
-	return ret;
+
+	rtree_contents_t neighbor_contents = rtree_leaf_elm_read(tsdn,
+	    &emap->rtree, elm, /* dependent */ true);
+	if (!extent_can_acquire_neighbor(edata, neighbor_contents, pai,
+	    expected_state, forward, expanding)) {
+		return NULL;
+	}
+
+	/* From this point, the neighbor edata can be safely acquired. */
+	edata_t *neighbor = neighbor_contents.edata;
+	assert(edata_state_get(neighbor) == expected_state);
+	emap_update_edata_state(tsdn, emap, neighbor, extent_state_merging);
+	if (expanding) {
+		extent_assert_can_expand(edata, neighbor);
+	} else {
+		extent_assert_can_coalesce(edata, neighbor);
+	}
+
+	return neighbor;
+}
+
+edata_t *
+emap_try_acquire_edata_neighbor(tsdn_t *tsdn, emap_t *emap, edata_t *edata,
+    extent_pai_t pai, extent_state_t expected_state, bool forward) {
+	return emap_try_acquire_edata_neighbor_impl(tsdn, emap, edata, pai,
+	    expected_state, forward, /* expand */ false);
+}
+
+edata_t *
+emap_try_acquire_edata_neighbor_expand(tsdn_t *tsdn, emap_t *emap,
+    edata_t *edata, extent_pai_t pai, extent_state_t expected_state) {
+	/* Try expanding forward. */
+	return emap_try_acquire_edata_neighbor_impl(tsdn, emap, edata, pai,
+	    expected_state, /* forward */ true, /* expand */ true);
+}
+
+void
+emap_release_edata(tsdn_t *tsdn, emap_t *emap, edata_t *edata,
+    extent_state_t new_state) {
+	assert(emap_edata_in_transition(tsdn, emap, edata));
+	assert(emap_edata_is_acquired(tsdn, emap, edata));
+
+	emap_update_edata_state(tsdn, emap, edata, new_state);
 }
 
 static bool
@@ -141,6 +144,9 @@ emap_rtree_write_acquired(tsdn_t *tsdn, emap_t *emap, rtree_leaf_elm_t *elm_a,
 	contents.edata = edata;
 	contents.metadata.szind = szind;
 	contents.metadata.slab = slab;
+	contents.metadata.is_head = (edata == NULL) ? false :
+	    edata_is_head_get(edata);
+	contents.metadata.state = (edata == NULL) ? 0 : edata_state_get(edata);
 	rtree_leaf_elm_write(tsdn, &emap->rtree, elm_a, contents);
 	if (elm_b != NULL) {
 		rtree_leaf_elm_write(tsdn, &emap->rtree, elm_b, contents);
@@ -150,6 +156,7 @@ emap_rtree_write_acquired(tsdn_t *tsdn, emap_t *emap, rtree_leaf_elm_t *elm_a,
 bool
 emap_register_boundary(tsdn_t *tsdn, emap_t *emap, edata_t *edata,
     szind_t szind, bool slab) {
+	assert(edata_state_get(edata) == extent_state_active);
 	EMAP_DECLARE_RTREE_CTX;
 
 	rtree_leaf_elm_t *elm_a, *elm_b;
@@ -158,31 +165,63 @@ emap_register_boundary(tsdn_t *tsdn, emap_t *emap, edata_t *edata,
 	if (err) {
 		return true;
 	}
+	assert(rtree_leaf_elm_read(tsdn, &emap->rtree, elm_a,
+	    /* dependent */ false).edata == NULL);
+	assert(rtree_leaf_elm_read(tsdn, &emap->rtree, elm_b,
+	    /* dependent */ false).edata == NULL);
 	emap_rtree_write_acquired(tsdn, emap, elm_a, elm_b, edata, szind, slab);
 	return false;
 }
 
+/* Invoked *after* emap_register_boundary. */
 void
 emap_register_interior(tsdn_t *tsdn, emap_t *emap, edata_t *edata,
     szind_t szind) {
 	EMAP_DECLARE_RTREE_CTX;
 
 	assert(edata_slab_get(edata));
+	assert(edata_state_get(edata) == extent_state_active);
 
-	/* Register interior. */
-	for (size_t i = 1; i < (edata_size_get(edata) >> LG_PAGE) - 1; i++) {
-		rtree_contents_t contents;
-		contents.edata = edata;
-		contents.metadata.szind = szind;
-		contents.metadata.slab = true;
-		rtree_write(tsdn, &emap->rtree, rtree_ctx,
-		    (uintptr_t)edata_base_get(edata) + (uintptr_t)(i <<
-		    LG_PAGE), contents);
+	if (config_debug) {
+		/* Making sure the boundary is registered already. */
+		rtree_leaf_elm_t *elm_a, *elm_b;
+		bool err = emap_rtree_leaf_elms_lookup(tsdn, emap, rtree_ctx,
+		    edata, /* dependent */ true, /* init_missing */ false,
+		    &elm_a, &elm_b);
+		assert(!err);
+		rtree_contents_t contents_a, contents_b;
+		contents_a = rtree_leaf_elm_read(tsdn, &emap->rtree, elm_a,
+		    /* dependent */ true);
+		contents_b = rtree_leaf_elm_read(tsdn, &emap->rtree, elm_b,
+		    /* dependent */ true);
+		assert(contents_a.edata == edata && contents_b.edata == edata);
+		assert(contents_a.metadata.slab && contents_b.metadata.slab);
 	}
+
+	rtree_contents_t contents;
+	contents.edata = edata;
+	contents.metadata.szind = szind;
+	contents.metadata.slab = true;
+	contents.metadata.state = extent_state_active;
+	contents.metadata.is_head = false; /* Not allowed to access. */
+
+	assert(edata_size_get(edata) > (2 << LG_PAGE));
+	rtree_write_range(tsdn, &emap->rtree, rtree_ctx,
+	    (uintptr_t)edata_base_get(edata) + PAGE,
+	    (uintptr_t)edata_last_get(edata) - PAGE, contents);
 }
 
 void
 emap_deregister_boundary(tsdn_t *tsdn, emap_t *emap, edata_t *edata) {
+	/*
+	 * The edata must be either in an acquired state, or protected by state
+	 * based locks.
+	 */
+	if (!emap_edata_is_acquired(tsdn, emap, edata)) {
+		witness_assert_positive_depth_to_rank(
+		    tsdn_witness_tsdp_get(tsdn), WITNESS_RANK_CORE);
+	}
+
 	EMAP_DECLARE_RTREE_CTX;
 	rtree_leaf_elm_t *elm_a, *elm_b;
 
@@ -197,10 +236,10 @@ emap_deregister_interior(tsdn_t *tsdn, emap_t *emap, edata_t *edata) {
 	EMAP_DECLARE_RTREE_CTX;
 
 	assert(edata_slab_get(edata));
-	for (size_t i = 1; i < (edata_size_get(edata) >> LG_PAGE) - 1; i++) {
-		rtree_clear(tsdn, &emap->rtree, rtree_ctx,
-		    (uintptr_t)edata_base_get(edata) + (uintptr_t)(i <<
-		    LG_PAGE));
+	if (edata_size_get(edata) > (2 << LG_PAGE)) {
+		rtree_clear_range(tsdn, &emap->rtree, rtree_ctx,
+		    (uintptr_t)edata_base_get(edata) + PAGE,
+		    (uintptr_t)edata_last_get(edata) - PAGE);
 	}
 }
 
@@ -214,6 +253,9 @@ emap_remap(tsdn_t *tsdn, emap_t *emap, edata_t *edata, szind_t szind,
 		contents.edata = edata;
 		contents.metadata.szind = szind;
 		contents.metadata.slab = slab;
+		contents.metadata.is_head = edata_is_head_get(edata);
+		contents.metadata.state = edata_state_get(edata);
+
 		rtree_write(tsdn, &emap->rtree, rtree_ctx,
 		    (uintptr_t)edata_addr_get(edata), contents);
 		/*
@@ -297,6 +339,8 @@ emap_merge_commit(tsdn_t *tsdn, emap_t *emap, emap_prepare_t *prepare,
 	clear_contents.edata = NULL;
 	clear_contents.metadata.szind = SC_NSIZES;
 	clear_contents.metadata.slab = false;
+	clear_contents.metadata.is_head = false;
+	clear_contents.metadata.state = (extent_state_t)0;
 
 	if (prepare->lead_elm_b != NULL) {
 		rtree_leaf_elm_write(tsdn, &emap->rtree,
@@ -320,8 +364,11 @@ void
 emap_do_assert_mapped(tsdn_t *tsdn, emap_t *emap, edata_t *edata) {
 	EMAP_DECLARE_RTREE_CTX;
 
-	assert(rtree_read(tsdn, &emap->rtree, rtree_ctx,
-	    (uintptr_t)edata_base_get(edata)).edata == edata);
+	rtree_contents_t contents = rtree_read(tsdn, &emap->rtree, rtree_ctx,
+	    (uintptr_t)edata_base_get(edata));
+	assert(contents.edata == edata);
+	assert(contents.metadata.is_head == edata_is_head_get(edata));
+	assert(contents.metadata.state == edata_state_get(edata));
 }
 
 void
